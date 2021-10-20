@@ -58,35 +58,7 @@ func (bp *BytePool) Put(b []byte) {
 	}
 }
 
-func transport(rw1, rw2 io.ReadWriter, remote string) error {
-	errc := make(chan error, 2)
-
-	go func() {
-		buf := BufferPool.Get()
-		defer BufferPool.Put(buf)
-		wt, err := io.CopyBuffer(rw1, rw2, buf)
-		web.NetWorkTransmitBytes.WithLabelValues(remote, web.METRIC_CONN_TCP).Add(float64(wt * 2))
-		errc <- err
-	}()
-
-	go func() {
-		buf := BufferPool.Get()
-		defer BufferPool.Put(buf)
-		wt, err := io.CopyBuffer(rw2, rw1, buf)
-		web.NetWorkTransmitBytes.WithLabelValues(remote, web.METRIC_CONN_TCP).Add(float64(wt * 2))
-		errc <- err
-	}()
-
-	err := <-errc
-	// NOTE 我们不关心 operror 比如 eof/reset/broken pipe
-	if err != nil {
-		if err == io.EOF || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
-			err = nil
-		}
-	}
-	return err
-}
-
+// todo: use io.copy buffer
 func transportWithDeadline(conn1, conn2 net.Conn, remote string) error {
 	// only set oneway deadline is enough
 	errChan := make(chan error, 2)
