@@ -2,18 +2,14 @@ package transporter
 
 import (
 	"context"
-	"fmt"
 	"net"
-	"net/http"
 	"sync"
 	"time"
 
 	"github.com/Ehco1996/ehco/internal/constant"
 	"github.com/Ehco1996/ehco/internal/lb"
-	"github.com/Ehco1996/ehco/internal/logger"
 	"github.com/Ehco1996/ehco/internal/web"
-	"github.com/Ehco1996/ehco/pkg/limiter"
-	"github.com/gobwas/ws"
+	"go.uber.org/zap"
 )
 
 type Raw struct {
@@ -22,7 +18,7 @@ type Raw struct {
 	UDPRemotes     lb.RoundRobin
 	UDPBufferChMap map[string]*BufferCh
 
-	ipLimiter *limiter.IPRateLimiter
+	L *zap.SugaredLogger
 }
 
 func (raw *Raw) GetOrCreateBufferCh(uaddr *net.UDPAddr) *BufferCh {
@@ -40,15 +36,14 @@ func (raw *Raw) GetOrCreateBufferCh(uaddr *net.UDPAddr) *BufferCh {
 
 func (raw *Raw) HandleUDPConn(uaddr *net.UDPAddr, local *net.UDPConn) {
 	remote := raw.UDPRemotes.Next()
-	web.CurConnectionCount.WithLabelValues(remote.Label, web.METRIC_CONN_UDP).Inc()
-	defer web.CurConnectionCount.WithLabelValues(remote.Label, web.METRIC_CONN_UDP).Dec()
+	web.CurConnectionCount.WithLabelValues(remote.Label, web.METRIC_CONN_TYPE_UDP).Inc()
+	defer web.CurConnectionCount.WithLabelValues(remote.Label, web.METRIC_CONN_TYPE_UDP).Dec()
 
 	bc := raw.GetOrCreateBufferCh(uaddr)
 	remoteUdp, _ := net.ResolveUDPAddr("udp", remote.Address)
 	rc, err := net.DialUDP("udp", nil, remoteUdp)
 	if err != nil {
-		remote.BlockForSomeTime()
-		logger.Info(err)
+		raw.L.Error(err)
 		return
 	}
 	defer func() {
@@ -58,7 +53,7 @@ func (raw *Raw) HandleUDPConn(uaddr *net.UDPAddr, local *net.UDPConn) {
 		raw.udpmu.Unlock()
 	}()
 
-	logger.Infof("[raw] HandleUDPConn from %s to %s", local.LocalAddr().String(), remote.Label)
+	raw.L.Infof("HandleUDPConn from %s to %s", local.LocalAddr().String(), remote.Label)
 
 	buf := BufferPool.Get()
 	defer BufferPool.Put(buf)
@@ -70,38 +65,47 @@ func (raw *Raw) HandleUDPConn(uaddr *net.UDPAddr, local *net.UDPConn) {
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		wt := 0
 		for {
-			_ = rc.SetDeadline(time.Now().Add(constant.DefaultDeadline))
+			_ = rc.SetDeadline(time.Now().Add(constant.IdleTimeOut))
 			i, err := rc.Read(buf)
 			if err != nil {
-				logger.Info(err)
+				raw.L.Error(err)
 				break
 			}
+			web.NetWorkTransmitBytes.WithLabelValues(
+				remote.Label, web.METRIC_CONN_TYPE_UDP, web.METRIC_CONN_FLOW_READ,
+			).Add(float64(i))
+
 			if _, err := local.WriteToUDP(buf[0:i], uaddr); err != nil {
-				logger.Info(err)
+				raw.L.Error(err)
 				break
 			}
-			wt += i
+			web.NetWorkTransmitBytes.WithLabelValues(
+				remote.Label, web.METRIC_CONN_TYPE_UDP, web.METRIC_CONN_FLOW_WRITE,
+			).Add(float64(i))
 		}
-		web.NetWorkTransmitBytes.WithLabelValues(remote.Label, web.METRIC_CONN_UDP).Add(float64(wt * 2))
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		wt := 0
 		select {
 		case <-ctx.Done():
 			return
 		case b := <-bc.Ch:
-			wt += len(b)
-			web.NetWorkTransmitBytes.WithLabelValues(remote.Label, web.METRIC_CONN_UDP).Add(float64(wt * 2))
+			// read from local udp listener ch
+			web.NetWorkTransmitBytes.WithLabelValues(
+				remote.Label, web.METRIC_CONN_TYPE_UDP, web.METRIC_CONN_FLOW_READ,
+			).Add(float64(len(b)))
+
+			_ = rc.SetDeadline(time.Now().Add(constant.IdleTimeOut))
 			if _, err := rc.Write(b); err != nil {
-				logger.Info(err)
+				raw.L.Error(err)
 				return
 			}
-			_ = rc.SetDeadline(time.Now().Add(constant.DefaultDeadline))
+			web.NetWorkTransmitBytes.WithLabelValues(
+				remote.Label, web.METRIC_CONN_TYPE_UDP, web.METRIC_CONN_FLOW_WRITE,
+			).Add(float64(len(b)))
 		}
 	}()
 	wg.Wait()
@@ -111,90 +115,28 @@ func (raw *Raw) GetRemote() *lb.Node {
 	return raw.TCPRemotes.Next()
 }
 
-func (raw *Raw) DialRemote(remote *lb.Node) (net.Conn, error) {
+func (raw *Raw) dialRemote(remote *lb.Node) (net.Conn, error) {
 	d := net.Dialer{Timeout: constant.DialTimeOut}
 	rc, err := d.Dial("tcp", remote.Address)
 	if err != nil {
-		remote.BlockForSomeTime()
-		logger.Errorf("dial error: %s", err)
+		raw.L.Errorf("dial error: %s", err)
 		return nil, err
 	}
 	return rc, nil
 }
 
-func (raw *Raw) LimitByIp(c *net.TCPConn) error {
-	fromIP := c.RemoteAddr().(*net.TCPAddr).IP.String()
-	if !raw.ipLimiter.CanServe(fromIP) {
-		return fmt.Errorf("ip %s reach the rate limit", fromIP)
-	}
-	return nil
-}
+func (raw *Raw) HandleTCPConn(c net.Conn, remote *lb.Node) error {
+	web.CurConnectionCount.WithLabelValues(remote.Label, web.METRIC_CONN_TYPE_TCP).Inc()
+	defer web.CurConnectionCount.WithLabelValues(remote.Label, web.METRIC_CONN_TYPE_TCP).Dec()
 
-func (raw *Raw) HandleTCPConn(c *net.TCPConn, remote *lb.Node) error {
 	defer c.Close()
-	rc, err := raw.DialRemote(remote)
+	t1 := time.Now()
+	rc, err := raw.dialRemote(remote)
+	web.HandShakeDuration.WithLabelValues(remote.Label).Observe(float64(time.Since(t1).Milliseconds()))
 	if err != nil {
 		return err
 	}
-	logger.Infof("[raw] HandleTCPConn from %s to %s", c.RemoteAddr(), remote.Address)
+	raw.L.Infof("HandleTCPConn from %s to %s", c.RemoteAddr(), remote.Address)
 	defer rc.Close()
 	return transport(rc, c, remote.Label)
-}
-
-func (raw *Raw) HandleWsRequest(w http.ResponseWriter, req *http.Request) {
-	wsc, _, _, err := ws.UpgradeHTTP(req, w)
-	if err != nil {
-		return
-	}
-	defer wsc.Close()
-	remote := raw.TCPRemotes.Next()
-	web.CurConnectionCount.WithLabelValues(remote.Label, web.METRIC_CONN_TCP).Inc()
-	defer web.CurConnectionCount.WithLabelValues(remote.Label, web.METRIC_CONN_TCP).Dec()
-	rc, err := raw.DialRemote(remote)
-	if err != nil {
-		return
-	}
-	defer rc.Close()
-	logger.Infof("[tun] HandleWsRequest from:%s to:%s", wsc.RemoteAddr(), remote.Address)
-	if err := transport(rc, wsc, remote.Label); err != nil {
-		logger.Infof("[tun] HandleWsRequest meet error from:%s to:%s err:%s", wsc.RemoteAddr(), remote.Address, err.Error())
-	}
-}
-
-func (raw *Raw) HandleWssRequest(w http.ResponseWriter, req *http.Request) {
-	wsc, _, _, err := ws.UpgradeHTTP(req, w)
-	if err != nil {
-		return
-	}
-	defer wsc.Close()
-	remote := raw.TCPRemotes.Next()
-	web.CurConnectionCount.WithLabelValues(remote.Label, web.METRIC_CONN_TCP).Inc()
-	defer web.CurConnectionCount.WithLabelValues(remote.Label, web.METRIC_CONN_TCP).Dec()
-
-	rc, err := raw.DialRemote(remote)
-	if err != nil {
-		return
-	}
-	defer rc.Close()
-	logger.Infof("[tun] HandleWssRequest from:%s to:%s", wsc.RemoteAddr(), remote.Address)
-	if err := transport(rc, wsc, remote.Label); err != nil {
-		logger.Infof("[tun] HandleWssRequest meet error from:%s to:%s err:", wsc.LocalAddr(), remote.Label, err.Error())
-	}
-}
-
-func (raw *Raw) HandleMWssRequest(c net.Conn) {
-	defer c.Close()
-	remote := raw.TCPRemotes.Next()
-	web.CurConnectionCount.WithLabelValues(remote.Label, web.METRIC_CONN_TCP).Inc()
-	defer web.CurConnectionCount.WithLabelValues(remote.Label, web.METRIC_CONN_TCP).Dec()
-
-	rc, err := raw.DialRemote(remote)
-	if err != nil {
-		return
-	}
-	defer rc.Close()
-	logger.Infof("[tun] HandleMWssRequest from:%s to:%s", c.RemoteAddr(), remote.Address)
-	if err := transport(rc, c, remote.Label); err != nil {
-		logger.Infof("[tun] HandleMWssRequest meet error from:%s to:%s err:%s", c.RemoteAddr(), remote.Label, err.Error())
-	}
 }

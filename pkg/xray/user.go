@@ -8,14 +8,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Ehco1996/ehco/internal/logger"
 	proxy "github.com/xtls/xray-core/app/proxyman/command"
 	stats "github.com/xtls/xray-core/app/stats/command"
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/proxy/shadowsocks"
+	"github.com/xtls/xray-core/proxy/trojan"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// now only support shadownsocks user,maybe support other protocol later
 type User struct {
 	running bool
 
@@ -27,6 +29,8 @@ type User struct {
 	Enable          bool  `json:"enable"`
 	UploadTraffic   int64 `json:"upload_traffic"`
 	DownloadTraffic int64 `json:"download_traffic"`
+
+	Protocol string `json:"protocol"`
 }
 
 type UserTraffic struct {
@@ -42,7 +46,6 @@ type SyncTrafficReq struct {
 }
 
 type SyncUserConfigsResp struct {
-	// TODO support other protocol
 	Users []*User `json:"users"`
 }
 
@@ -74,6 +77,17 @@ func (u *User) UpdateFromServer(serverSideUser *User) {
 
 func (u *User) Equal(new *User) bool {
 	return u.Method == new.Method && u.Enable == new.Enable && u.Password == new.Password
+}
+
+func (u *User) ToXrayUser() *protocol.User {
+	var account *serial.TypedMessage
+	switch u.Protocol {
+	case "trojan":
+		account = serial.ToTypedMessage(&trojan.Account{Password: u.Password})
+	default:
+		account = serial.ToTypedMessage(&shadowsocks.Account{CipherType: mappingCipher(u.Method), Password: u.Password})
+	}
+	return &protocol.User{Level: uint32(u.Level), Email: u.GetEmail(), Account: account}
 }
 
 // UserPool user pool
@@ -110,8 +124,7 @@ func NewUserPool(ctx context.Context, xrayEndPoint string) (*UserPool, error) {
 	return up, nil
 }
 
-// CreateUser get create user
-func (up *UserPool) CreateUser(userId, level int, password, method string, enable bool) *User {
+func (up *UserPool) CreateUser(userId, level int, password, method, protocol string, enable bool) *User {
 	up.Lock()
 	defer up.Unlock()
 	u := &User{
@@ -121,6 +134,7 @@ func (up *UserPool) CreateUser(userId, level int, password, method string, enabl
 		Level:    level,
 		Enable:   enable,
 		Method:   method,
+		Protocol: protocol,
 	}
 	up.users[u.ID] = u
 	return u
@@ -150,7 +164,7 @@ func (up *UserPool) GetAllUsers() []*User {
 	return users
 }
 
-func (up *UserPool) syncTrafficToServer(ctx context.Context, endpoint string) error {
+func (up *UserPool) syncTrafficToServer(ctx context.Context, endpoint, tag string) error {
 	// sync traffic from xray server
 	// V2ray的stats的统计模块设计的非常奇怪，具体规则如下
 	// 上传流量："user>>>" + user.Email + ">>>traffic>>>uplink"
@@ -168,7 +182,15 @@ func (up *UserPool) syncTrafficToServer(ctx context.Context, endpoint string) er
 		}
 		user, found := up.GetUser(userID)
 		if !found {
-			logger.Logger.Panicf("user not found, user id: %d", userID)
+			l.Warnf(
+				"user in xray not found in user pool this user maybe out of traffic, user id: %d, leak traffic: %d",
+				userID, stat.Value)
+			fakeUser := &User{ID: userID}
+			if err := RemoveInboundUser(ctx, up.proxyClient, tag, fakeUser); err != nil {
+				l.Warnf(
+					"tring remove leak user failed, user id: %d err: %s", userID, err.Error())
+			}
+			continue
 		}
 		switch trafficType {
 		case "uplink":
@@ -182,7 +204,7 @@ func (up *UserPool) syncTrafficToServer(ctx context.Context, endpoint string) er
 	for _, user := range up.GetAllUsers() {
 		tf := user.DownloadTraffic + user.UploadTraffic
 		if tf > 0 {
-			logger.Infof("[xray] User: %v Now Used Total Traffic: %v", user.ID, tf)
+			l.Infof("User: %v Now Used Total Traffic: %v", user.ID, tf)
 			tfs = append(tfs, user.GenTraffic())
 			user.ResetTraffic()
 		}
@@ -190,52 +212,65 @@ func (up *UserPool) syncTrafficToServer(ctx context.Context, endpoint string) er
 	if err := postJson(up.httpClient, endpoint, &SyncTrafficReq{Data: tfs}); err != nil {
 		return err
 	}
-	logger.Infof("[xray] Call syncTrafficToServer ONLINE USER COUNT: %d", len(tfs))
+	l.Infof("Call syncTrafficToServer ONLINE USER COUNT: %d", len(tfs))
 	return nil
 }
 
-func (up *UserPool) syncUserConfigsFromServer(ctx context.Context, endpoint string) error {
+func (up *UserPool) syncUserConfigsFromServer(ctx context.Context, endpoint, tag string) error {
 	resp := SyncUserConfigsResp{}
 	if err := getJson(up.httpClient, endpoint, &resp); err != nil {
 		return err
 	}
+	userM := make(map[int]struct{})
 	for _, newUser := range resp.Users {
 		oldUser, found := up.GetUser(newUser.ID)
 		if !found {
-			newUser := up.CreateUser(newUser.ID, newUser.Level, newUser.Password, newUser.Method, newUser.Enable)
+			newUser := up.CreateUser(
+				newUser.ID, newUser.Level, newUser.Password, newUser.Method, newUser.Protocol, newUser.Enable)
 			if newUser.Enable {
-				if err := AddInboundUser(ctx, up.proxyClient, XraySSProxyTag, newUser); err != nil {
+				if err := AddInboundUser(ctx, up.proxyClient, tag, newUser); err != nil {
 					return err
 				}
 			}
 		} else {
+			// update user configs
 			if !oldUser.Equal(newUser) {
 				if oldUser.running {
-					if err := RemoveInboundUser(ctx, up.proxyClient, XraySSProxyTag, oldUser); err != nil {
+					if err := RemoveInboundUser(ctx, up.proxyClient, tag, oldUser); err != nil {
 						return err
 					}
 				}
 				oldUser.UpdateFromServer(newUser)
 			}
 			if oldUser.Enable && !oldUser.running {
-				if err := AddInboundUser(ctx, up.proxyClient, XraySSProxyTag, oldUser); err != nil {
+				if err := AddInboundUser(ctx, up.proxyClient, tag, oldUser); err != nil {
 					return err
 				}
 			}
+		}
+		userM[newUser.ID] = struct{}{}
+	}
+	// remove user not in server
+	for _, user := range up.GetAllUsers() {
+		if _, ok := userM[user.ID]; !ok {
+			if err := RemoveInboundUser(ctx, up.proxyClient, tag, user); err != nil {
+				return err
+			}
+			up.RemoveUser(user.ID)
 		}
 	}
 	return nil
 }
 
-func (up *UserPool) StartSyncUserTask(ctx context.Context, endpoint string) {
-	logger.Infof("[xray] Start Sync User Task")
+func (up *UserPool) StartSyncUserTask(ctx context.Context, endpoint, tag string) {
+	l.Infof("Start Sync User Task")
 
 	syncOnce := func() {
-		if err := up.syncUserConfigsFromServer(ctx, endpoint); err != nil {
-			logger.Errorf("[xray] Sync User Configs From Server Error: %v", err)
+		if err := up.syncUserConfigsFromServer(ctx, endpoint, tag); err != nil {
+			l.Errorf("Sync User Configs From Server Error: %v", err)
 		}
-		if err := up.syncTrafficToServer(ctx, endpoint); err != nil {
-			logger.Errorf("[xray] Sync Traffic From Server Error: %v", err)
+		if err := up.syncTrafficToServer(ctx, endpoint, tag); err != nil {
+			l.Errorf("Sync Traffic From Server Error: %v", err)
 		}
 	}
 	syncOnce()

@@ -2,14 +2,14 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/Ehco1996/ehco/internal/constant"
-	"github.com/Ehco1996/ehco/internal/logger"
 	"github.com/xtls/xray-core/infra/conf"
 )
 
@@ -26,6 +26,7 @@ func (r *RelayConfig) Validate() error {
 	if r.ListenType != constant.Listen_RAW &&
 		r.ListenType != constant.Listen_WS &&
 		r.ListenType != constant.Listen_WSS &&
+		r.ListenType != constant.Listen_MTCP &&
 		r.ListenType != constant.Listen_MWSS {
 		return fmt.Errorf("invalid listen type:%s", r.ListenType)
 	}
@@ -33,8 +34,29 @@ func (r *RelayConfig) Validate() error {
 	if r.TransportType != constant.Transport_RAW &&
 		r.TransportType != constant.Transport_WS &&
 		r.TransportType != constant.Transport_WSS &&
+		r.TransportType != constant.Transport_MTCP &&
 		r.TransportType != constant.Transport_MWSS {
 		return fmt.Errorf("invalid transport type:%s", r.ListenType)
+	}
+
+	if r.Listen == "" {
+		return fmt.Errorf("invalid listen:%s", r.Listen)
+	}
+
+	for _, addr := range r.TCPRemotes {
+		if addr == "" {
+			return fmt.Errorf("invalid tcp remote addr:%s", addr)
+		}
+	}
+
+	for _, addr := range r.UDPRemotes {
+		if addr == "" {
+			return fmt.Errorf("invalid udp remote addr:%s", addr)
+		}
+	}
+
+	if len(r.TCPRemotes) == 0 && len(r.UDPRemotes) == 0 {
+		return errors.New("both tcp and udp remotes are empty")
 	}
 	return nil
 }
@@ -45,6 +67,7 @@ type Config struct {
 	WebPort    int    `json:"web_port,omitempty"`
 	WebToken   string `json:"web_token,omitempty"`
 	EnablePing bool   `json:"enable_ping,omitempty"`
+	LogLeveL   string `json:"log_level,omitempty"`
 
 	RelayConfigs        []RelayConfig `json:"relay_configs"`
 	XRayConfig          *conf.Config  `json:"xray_config,omitempty"`
@@ -73,11 +96,11 @@ func (c *Config) LoadConfig() error {
 }
 
 func (c *Config) readFromFile() error {
-	file, err := ioutil.ReadFile(c.PATH)
+	file, err := os.ReadFile(c.PATH)
 	if err != nil {
 		return err
 	}
-	logger.Info("[cfg] Load Config From file: ", c.PATH)
+	println("Load Config From file:", c.PATH)
 	if err != nil {
 		return err
 	}
@@ -91,7 +114,7 @@ func (c *Config) readFromHttp() error {
 		return err
 	}
 	defer r.Body.Close()
-	logger.Info("[cfg] Load Config From http:", c.PATH)
+	println("Load Config From http:", c.PATH)
 	return json.NewDecoder(r.Body).Decode(&c)
 }
 
@@ -101,6 +124,9 @@ func (c *Config) Validate() error {
 		if err := r.Validate(); err != nil {
 			return err
 		}
+	}
+	if c.LogLeveL == "" {
+		c.LogLeveL = "info"
 	}
 	return nil
 }
